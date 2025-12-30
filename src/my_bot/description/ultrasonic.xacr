@@ -1,0 +1,88 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" >
+
+    <!-- Ultrasonic Sensor Macro -->
+    <xacro:macro name="ultrasonic_sensor" params="name x y z yaw">
+        
+        <!-- Ultrasonic Sensor Joint -->
+        <joint name="ultrasonic_joint_${name}" type="fixed">
+            <parent link="chassis"/>
+            <child link="ultrasonic_frame_${name}"/>
+            <origin xyz="${x} ${y} ${z}" rpy="0 0 ${yaw}"/>
+        </joint>
+
+        <!-- Ultrasonic Sensor Link -->
+        <link name="ultrasonic_frame_${name}">
+            <visual>
+                <geometry>
+                    <box size="0.03 0.03 0.02"/>
+                </geometry>
+                <material name="blue"/>
+            </visual>
+        </link>
+
+        <!-- Gazebo Ultrasonic Sensor Configuration -->
+        <gazebo reference="ultrasonic_frame_${name}">
+            <material>Gazebo/Blue</material>
+            <gravity>false</gravity>
+            <mu1>0.0</mu1>
+            <mu2>0.0</mu2>
+
+            <sensor name="ultrasonic_${name}" type="ray">
+                <pose> 0 0 0 0 0 0 </pose>
+                <visualize>true</visualize>
+                <update_rate>20</update_rate>
+                <ray>
+                    <scan>
+                        <horizontal>
+                            <samples>80</samples>
+                            <min_angle>-0.12</min_angle>
+                            <max_angle>0.12</max_angle>
+                            <resolution>1</resolution>
+                        </horizontal>
+                    </scan>
+                    <range>
+                        <min>0.02</min>
+                        <max>4.0</max>
+                        <resolution>0.01</resolution>
+                    </range>
+                </ray>
+                <plugin name="ultrasonic_controller_${name}" filename="libgazebo_ros_ray_sensor.so">
+                    <ros>
+                        <argument>~/out:=ultrasonic_scan_${name}</argument><!-- where to save the output, i can make it save at the same output file of the lidar, we didn't need to separate them, i think. after i try, i think that this didn't work... -->
+                    </ros><!-- BASE LINK -->
+                    <output_type>sensor_msgs/LaserScan</output_type> <!-- the output type, laserscan is for lidar, ultrasonic, and IRs -->
+                    <frame_name>ultrasonic_frame_${name}</frame_name>
+                </plugin>
+            </sensor>
+        </gazebo>
+        
+    </xacro:macro>
+
+    <!-- 8 Ultrasonic Sensors positioned around the robot -->
+    
+    <!-- Front (0°) and up -->
+    <xacro:ultrasonic_sensor name="front_up" x="0.35" y="0.0" z="0.20" yaw="0"/>
+    
+    <!-- Front (0°) and down -->
+    <xacro:ultrasonic_sensor name="front_down" x="0.35" y="0" z="0.0" yaw="0"/>
+    
+    <!-- Right (45°) and up -->
+    <xacro:ultrasonic_sensor name="right_up" x="0.29" y="-0.13" z="0.20" yaw="-0.7854"/>
+    
+    <!-- Right (45°) and down -->
+    <xacro:ultrasonic_sensor name="right_down" x="0.29" y="-0.13" z="0.0" yaw="-0.7854"/>
+    
+    <!-- Left (-45°) and up -->
+    <xacro:ultrasonic_sensor name="left_up" x="0.29" y="0.13" z="0.20" yaw="0.7854"/>
+    
+    <!-- Left (-45°) and down -->
+    <xacro:ultrasonic_sensor name="left_down" x="0.29" y="0.13" z="0.0" yaw="0.7854"/>
+    
+    <!-- rear (180°) and up -->
+    <xacro:ultrasonic_sensor name="rear_up" x="-0.05" y="0.0" z="0.20" yaw="3.14"/>
+    
+    <!-- rear (180°) and down -->
+    <xacro:ultrasonic_sensor name="rear_down" x="-0.05" y="0.0" z="0.00" yaw="3.14"/>
+
+</robot>
