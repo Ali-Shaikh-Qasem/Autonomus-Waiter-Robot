@@ -37,10 +37,11 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
+# Install Python scripts as executables
 install(
   PROGRAMS
-  scripts/ultrasonic_obstacle_layer.py
-  scripts/reactive_ultrasonic_avoidance.py
+  scripts/ultrasonic_scan_to_range.py
+  scripts/ultrasonic_detour_supervisor.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
