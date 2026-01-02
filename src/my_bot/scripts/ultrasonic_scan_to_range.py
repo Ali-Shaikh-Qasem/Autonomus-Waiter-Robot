@@ -4,10 +4,6 @@ ultrasonic_scan_to_range.py
 
 ROS2 (Humble) node that converts Gazebo ultrasonic LaserScan topics into Range topics.
 
-Fix included:
-- DO NOT assign to self.publishers (Node has a read-only attribute named publishers)
-  -> use self.range_pubs instead.
-
 Behavior:
 - Subscribe to /ultrasonic_scan_* (LaserScan)
 - Publish /us/* (Range) with one reading per sensor (min valid range)
