@@ -1,227 +1,198 @@
 #!/usr/bin/env python3
 """
-Ultrasonic LaserScan to Range Converter Node
+ultrasonic_scan_to_range.py
 
-This node converts LaserScan messages from ultrasonic sensors to Range messages
-for use with Nav2's RangeSensorLayer in the local costmap.
+ROS2 (Humble) node that converts Gazebo ultrasonic LaserScan topics into Range topics.
 
-Each ultrasonic sensor publishes a LaserScan with multiple rays spanning a small FOV.
-This node extracts the minimum valid range and publishes it as a single Range message.
+Fix included:
+- DO NOT assign to self.publishers (Node has a read-only attribute named publishers)
+  -> use self.range_pubs instead.
+
+Behavior:
+- Subscribe to /ultrasonic_scan_* (LaserScan)
+- Publish /us/* (Range) with one reading per sensor (min valid range)
+- If scan has no valid readings: publish max_range (meaning "clear")
+- Optional stale publishing of max_range if sensor stops publishing
 """
+
+import math
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy, QoSHistoryPolicy
 from sensor_msgs.msg import LaserScan, Range
-import math
-from typing import Dict, Optional
-from dataclasses import dataclass
-from datetime import datetime
 
 
 @dataclass
-class SensorData:
-    """Holds the latest data for a sensor."""
-    last_range: float = float('inf')
-    last_stamp: Optional[datetime] = None
-    frame_id: str = ""
+class SensorState:
+    last_value: float = None
+    last_stamp_sec: float = None
+    last_frame_id: str = None
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
 
 
 class UltrasonicScanToRange(Node):
-    """
-    ROS2 Node that converts ultrasonic LaserScan messages to Range messages.
-    
-    Subscribes to 6 ultrasonic LaserScan topics and publishes corresponding
-    Range messages suitable for Nav2 RangeSensorLayer.
-    """
-
-    # Mapping from input topic suffix to output topic name
-    SENSOR_MAPPING = {
-        'front_up': '/us/front_up',
-        'front_down': '/us/front_down',
-        'left_up': '/us/left_up',
-        'left_down': '/us/left_down',
-        'right_up': '/us/right_up',
-        'right_down': '/us/right_down',
-    }
-
     def __init__(self):
-        super().__init__('ultrasonic_scan_to_range')
+        super().__init__("ultrasonic_scan_to_range")
 
-        # Declare parameters
-        self.declare_parameter('min_range', 0.02)
-        self.declare_parameter('max_range', 4.0)
-        self.declare_parameter('fov_rad', 0.24)  # ~0.12 to +0.12 rad = 0.24 rad total
-        self.declare_parameter('timeout_sec', 0.5)
-        self.declare_parameter('log_rate_sec', 1.0)
+        # -------------------------
+        # Parameters
+        # -------------------------
+        self.declare_parameter("min_range", 0.02)
+        self.declare_parameter("max_range", 4.0)
+        self.declare_parameter("fov_rad", 0.24)          # matches -0.12..+0.12 in your Gazebo ray scan
+        self.declare_parameter("timeout_sec", 0.5)       # stale sensor timeout
+        self.declare_parameter("include_rear", False)    # enable if you use rear sensors too
+        self.declare_parameter("publish_stale_clears", True)
 
-        # Get parameters
-        self.min_range = self.get_parameter('min_range').get_parameter_value().double_value
-        self.max_range = self.get_parameter('max_range').get_parameter_value().double_value
-        self.fov_rad = self.get_parameter('fov_rad').get_parameter_value().double_value
-        self.timeout_sec = self.get_parameter('timeout_sec').get_parameter_value().double_value
-        self.log_rate_sec = self.get_parameter('log_rate_sec').get_parameter_value().double_value
+        # Optional smoothing (EMA)
+        self.declare_parameter("ema_alpha", 0.0)         # 0 disables EMA; typical 0.3..0.6
 
-        self.get_logger().info(
-            f"Ultrasonic converter initialized: min_range={self.min_range}, "
-            f"max_range={self.max_range}, fov_rad={self.fov_rad:.3f}"
+        self.min_range = float(self.get_parameter("min_range").value)
+        self.max_range = float(self.get_parameter("max_range").value)
+        self.fov_rad = float(self.get_parameter("fov_rad").value)
+        self.timeout_sec = float(self.get_parameter("timeout_sec").value)
+        self.include_rear = bool(self.get_parameter("include_rear").value)
+        self.publish_stale_clears = bool(self.get_parameter("publish_stale_clears").value)
+        self.ema_alpha = float(self.get_parameter("ema_alpha").value)
+        self.ema_alpha = clamp(self.ema_alpha, 0.0, 1.0)
+
+        # -------------------------
+        # QoS (sensor data)
+        # -------------------------
+        self.sensor_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
         )
 
-        # Sensor QoS (best effort, depth 1) for sensor data
-        sensor_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1
-        )
+        # -------------------------
+        # Topic mapping
+        # -------------------------
+        self.sensor_configs: List[Tuple[str, str, str]] = [
+            ("/ultrasonic_scan_front_up",   "/us/front_up",   "front_up"),
+            ("/ultrasonic_scan_front_down", "/us/front_down", "front_down"),
+            ("/ultrasonic_scan_left_up",    "/us/left_up",    "left_up"),
+            ("/ultrasonic_scan_left_down",  "/us/left_down",  "left_down"),
+            ("/ultrasonic_scan_right_up",   "/us/right_up",   "right_up"),
+            ("/ultrasonic_scan_right_down", "/us/right_down", "right_down"),
+        ]
+        if self.include_rear:
+            self.sensor_configs += [
+                ("/ultrasonic_scan_rear_up",   "/us/rear_up",   "rear_up"),
+                ("/ultrasonic_scan_rear_down", "/us/rear_down", "rear_down"),
+            ]
 
-        # Storage for sensor data
-        self.sensor_data: Dict[str, SensorData] = {}
-        
-        # Publishers dictionary
-        self.range_publishers: Dict[str, rclpy.publisher.Publisher] = {}
-        
-        # Create subscriptions and publishers for each sensor
-        for sensor_name, output_topic in self.SENSOR_MAPPING.items():
-            input_topic = f'/ultrasonic_scan_{sensor_name}'
-            
-            # Initialize sensor data
-            self.sensor_data[sensor_name] = SensorData()
-            
-            # Create publisher for Range message
-            self.range_publishers[sensor_name] = self.create_publisher(
-                Range,
-                output_topic,
-                10
-            )
-            
-            # Create subscription for LaserScan
-            # Using a lambda with default argument to capture sensor_name correctly
+        # -------------------------
+        # Publishers/Subscribers
+        # IMPORTANT: do NOT name it self.publishers
+        # -------------------------
+        self.range_pubs: Dict[str, rclpy.publisher.Publisher] = {}
+        self.states: Dict[str, SensorState] = {}
+
+        for scan_topic, range_topic, name in self.sensor_configs:
+            self.range_pubs[range_topic] = self.create_publisher(Range, range_topic, self.sensor_qos)
+            self.states[name] = SensorState()
+
             self.create_subscription(
                 LaserScan,
-                input_topic,
-                lambda msg, name=sensor_name: self.scan_callback(msg, name),
-                sensor_qos
+                scan_topic,
+                lambda msg, n=name, rt=range_topic: self.scan_cb(msg, n, rt),
+                self.sensor_qos,
             )
-            
-            self.get_logger().info(f"Mapping: {input_topic} -> {output_topic}")
 
-        # Timer for periodic logging
-        self.last_log_time = self.get_clock().now()
-        self.create_timer(self.log_rate_sec, self.log_status)
+            self.get_logger().info(f"Configured: {scan_topic} -> {range_topic}")
 
-    def scan_callback(self, msg: LaserScan, sensor_name: str) -> None:
-        """
-        Process incoming LaserScan and publish corresponding Range message.
-        
-        Args:
-            msg: The incoming LaserScan message
-            sensor_name: Name of the sensor (e.g., 'front_up')
-        """
-        # Extract minimum valid range from the scan
-        min_range_value = self.extract_min_range(msg)
-        
-        # Update sensor data for logging
-        self.sensor_data[sensor_name].last_stamp = datetime.now()
-        self.sensor_data[sensor_name].frame_id = msg.header.frame_id
-        self.sensor_data[sensor_name].last_range = min_range_value
-        
-        # Create and publish Range message
-        range_msg = Range()
-        
-        # Use the same timestamp from LaserScan for proper TF lookup
-        range_msg.header.stamp = msg.header.stamp
-        # CRITICAL: Use exact same frame_id for proper costmap placement
-        range_msg.header.frame_id = msg.header.frame_id
-        
-        range_msg.radiation_type = Range.ULTRASOUND
-        range_msg.field_of_view = self.fov_rad
-        range_msg.min_range = self.min_range
-        range_msg.max_range = self.max_range
-        
-        # Clamp range to valid bounds
-        if math.isfinite(min_range_value):
-            range_msg.range = max(self.min_range, min(min_range_value, self.max_range))
-        else:
-            # No valid reading - publish max_range (indicates clear)
-            range_msg.range = self.max_range
-        
-        self.range_publishers[sensor_name].publish(range_msg)
+        # Timer for stale sensors
+        self.stale_timer = self.create_timer(0.1, self.stale_check_cb)
 
-    def extract_min_range(self, msg: LaserScan) -> float:
-        """
-        Extract the minimum valid range from a LaserScan message.
-        
-        Args:
-            msg: LaserScan message to process
-            
-        Returns:
-            Minimum valid range value, or inf if no valid readings
-        """
-        min_val = float('inf')
-        
+        self.get_logger().info(
+            f"UltrasonicScanToRange ready | min={self.min_range} max={self.max_range} fov={self.fov_rad} "
+            f"ema_alpha={self.ema_alpha}"
+        )
+
+    def now_sec(self) -> float:
+        return self.get_clock().now().nanoseconds / 1e9
+
+    def scan_cb(self, msg: LaserScan, sensor_name: str, range_topic: str):
+        # Collect valid ranges
+        valid: List[float] = []
+        scan_rmin = msg.range_min if math.isfinite(msg.range_min) else self.min_range
+        scan_rmax = msg.range_max if math.isfinite(msg.range_max) else self.max_range
+        scan_rmin = max(scan_rmin, 0.0)
+        scan_rmax = max(scan_rmax, scan_rmin)
+
         for r in msg.ranges:
-            # Check for valid reading:
-            # - Must be finite (not nan, not inf)
-            # - Must be greater than minimum threshold (0.01m to filter noise)
-            # - Must be within sensor's reported range
-            if (math.isfinite(r) and 
-                r > 0.01 and 
-                r >= msg.range_min and 
-                r <= msg.range_max):
-                min_val = min(min_val, r)
-        
-        return min_val
+            if not math.isfinite(r) or math.isnan(r):
+                continue
+            if r <= 0.0:
+                continue
+            if r < scan_rmin or r > scan_rmax:
+                continue
+            valid.append(r)
 
-    def log_status(self) -> None:
-        """
-        Periodic logging of sensor status.
-        Logs min values and warns about stale sensors.
-        """
-        now = datetime.now()
-        
-        # Group sensors by position
-        groups = {
-            'front': ['front_up', 'front_down'],
-            'left': ['left_up', 'left_down'],
-            'right': ['right_up', 'right_down'],
-        }
-        
-        status_parts = []
-        stale_sensors = []
-        
-        for group_name, sensors in groups.items():
-            min_range = float('inf')
-            for sensor in sensors:
-                data = self.sensor_data[sensor]
-                if data.last_stamp is not None:
-                    age = (now - data.last_stamp).total_seconds()
-                    if age > self.timeout_sec:
-                        stale_sensors.append(sensor)
-                    if math.isfinite(data.last_range):
-                        min_range = min(min_range, data.last_range)
-                else:
-                    stale_sensors.append(sensor)
-            
-            if math.isfinite(min_range):
-                status_parts.append(f"{group_name}={min_range:.2f}m")
-            else:
-                status_parts.append(f"{group_name}=--")
-        
-        # Log status (throttled by timer)
-        self.get_logger().info(f"Ultrasonic ranges: {', '.join(status_parts)}")
-        
-        # Warn about stale sensors
-        if stale_sensors:
-            self.get_logger().warn(
-                f"No data from sensors (>{self.timeout_sec}s): {', '.join(stale_sensors)}"
-            )
+        # Reduce to one value (min valid)
+        if valid:
+            r_out = min(valid)
+        else:
+            r_out = self.max_range  # no hit => clear
+
+        # Clamp
+        r_out = clamp(r_out, self.min_range, self.max_range)
+
+        # Optional EMA
+        st = self.states[sensor_name]
+        if self.ema_alpha > 0.0 and st.last_value is not None:
+            r_out = self.ema_alpha * r_out + (1.0 - self.ema_alpha) * st.last_value
+
+        # Update state
+        now = self.now_sec()
+        st.last_value = r_out
+        st.last_stamp_sec = now
+        st.last_frame_id = msg.header.frame_id if msg.header.frame_id else st.last_frame_id
+
+        # Publish Range
+        self.publish_range(range_topic, st.last_frame_id, msg.header.stamp, r_out)
+
+    def publish_range(self, range_topic: str, frame_id: str, stamp, value: float):
+        rmsg = Range()
+        rmsg.header.stamp = stamp
+        rmsg.header.frame_id = frame_id if frame_id else ""
+        rmsg.radiation_type = Range.ULTRASOUND
+        rmsg.field_of_view = float(self.fov_rad)
+        rmsg.min_range = float(self.min_range)
+        rmsg.max_range = float(self.max_range)
+        rmsg.range = float(value)
+
+        pub = self.range_pubs.get(range_topic)
+        if pub is not None:
+            pub.publish(rmsg)
+
+    def stale_check_cb(self):
+        if not self.publish_stale_clears:
+            return
+
+        now = self.now_sec()
+        for _, range_topic, name in self.sensor_configs:
+            st = self.states.get(name)
+            if st is None or st.last_stamp_sec is None:
+                continue
+
+            if (now - st.last_stamp_sec) > self.timeout_sec:
+                # publish clear reading to avoid stale "stuck obstacle"
+                stamp = self.get_clock().now().to_msg()
+                self.publish_range(range_topic, st.last_frame_id, stamp, self.max_range)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    
     node = UltrasonicScanToRange()
-    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -231,5 +202,5 @@ def main(args=None):
         rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
