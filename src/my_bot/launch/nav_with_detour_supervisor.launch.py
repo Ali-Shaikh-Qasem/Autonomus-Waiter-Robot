@@ -1,5 +1,5 @@
 """
-Launch file for Nav2 with Ultrasonic Detour Supervisor (v3)
+Launch file for Nav2 with Ultrasonic Detour Supervisor (v3.1)
 
 Nav2 -> /cmd_vel_nav -> Supervisor -> /cmd_vel
 """
@@ -78,12 +78,16 @@ def generate_launch_description():
             # trigger
             'avoid_extra_m': 0.25,
 
-            # exit conditions (KEY FIX)
+            # NEW: corner trigger
+            'corner_extra_m': 0.05,   # D_corner = D_stop + 0.05  (~0.35)
+            'corner_v_min': 0.03,
+
+            # exit conditions
             'clear_front_m': 0.90,
             'detour_clear_m': 0.80,
             'obstacle_min_m': 0.38,
 
-            # arc tuning (less aggressive)
+            # arc tuning
             'v_max_detour': 0.12,
             'w_min': 0.20,
             'w_max': 0.70,
@@ -97,6 +101,11 @@ def generate_launch_description():
             'wall_target_m': 0.55,
             'k_wall_pass': 1.2,
             'w_pass_max': 0.35,
+
+            # NEW: early exit (prevents overshoot for small obstacles)
+            'pass_min_distance_m': 0.30,
+            'pass_clear_margin_m': 0.10,     # early clear if dObs > wall_target + 0.10
+            'pass_clear_stable_ms': 200,
 
             # navigate side safety
             'side_nudge_enable': True,

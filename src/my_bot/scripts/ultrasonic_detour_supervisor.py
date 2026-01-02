@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Ultrasonic Detour Supervisor (v3 - fixes over-rotation)
+Ultrasonic Detour Supervisor (v3.1 - corner trigger + early forward-pass exit)
 
-Key changes vs v2:
-1) ARC exit uses DETOUR-side clearance (the side we want to pass through),
-   not "obstacle-side must be huge", which caused long arcs and near-180 turns.
-2) Adds max_arc_yaw_deg cap to prevent rotating too far.
-3) Forward pass uses adaptive wall-avoid steering (nudges away only when needed).
+Based on v3:
+- Keeps v3 fixes: detour-side exit logic + yaw cap + adaptive wall steering.
+Adds two small improvements:
+1) Corner-trigger: during NAVIGATING, trigger avoidance if a corner obstacle is detected
+   by left/right sensors even when front doesn't see it.
+2) Early exit in forward pass: if we moved a small minimum distance and the obstacle-side
+   becomes clearly safe (stable), exit forward pass early (prevents overshoot).
 
 Nav2 -> /cmd_vel_nav -> supervisor -> /cmd_vel
 Sensors: /us/front_*, /us/left_*, /us/right_* (Range)
@@ -54,7 +56,6 @@ def clamp(x, lo, hi):
 
 
 def quat_to_yaw(q):
-    # yaw from quaternion
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny_cosp, cosy_cosp)
@@ -82,6 +83,11 @@ class UltrasonicDetourSupervisor(Node):
 
         # Trigger distances
         self.declare_parameter('avoid_extra_m', 0.25)  # D_avoid = D_stop + avoid_extra
+
+        # NEW: corner-trigger params
+        # D_corner = D_stop + corner_extra_m
+        self.declare_parameter('corner_extra_m', 0.05)
+        self.declare_parameter('corner_v_min', 0.03)  # only consider corner trigger if moving forward faster than this
 
         # Exit criteria (IMPORTANT)
         self.declare_parameter('clear_front_m', 0.90)      # front must be this clear
@@ -117,6 +123,11 @@ class UltrasonicDetourSupervisor(Node):
         self.declare_parameter('k_wall_pass', 1.2)          # steering gain away from obstacle-side
         self.declare_parameter('w_pass_max', 0.35)          # max pass yaw rate
 
+        # NEW: early exit in forward pass
+        self.declare_parameter('pass_min_distance_m', 0.30)     # must move at least this much before early exit
+        self.declare_parameter('pass_clear_margin_m', 0.10)     # early-clear requires dObs > wall_target + margin
+        self.declare_parameter('pass_clear_stable_ms', 200)     # early-clear must be stable for this long
+
         # Backup
         self.declare_parameter('backup_duration_sec', 0.6)
         self.declare_parameter('v_backup', 0.10)
@@ -146,6 +157,9 @@ class UltrasonicDetourSupervisor(Node):
         self.safety_margin = float(self.get_parameter('safety_margin_m').value)
         self.avoid_extra = float(self.get_parameter('avoid_extra_m').value)
 
+        self.corner_extra = float(self.get_parameter('corner_extra_m').value)
+        self.corner_v_min = float(self.get_parameter('corner_v_min').value)
+
         self.clear_front = float(self.get_parameter('clear_front_m').value)
         self.detour_clear = float(self.get_parameter('detour_clear_m').value)
         self.obstacle_min = float(self.get_parameter('obstacle_min_m').value)
@@ -173,6 +187,10 @@ class UltrasonicDetourSupervisor(Node):
         self.k_wall_pass = float(self.get_parameter('k_wall_pass').value)
         self.w_pass_max = float(self.get_parameter('w_pass_max').value)
 
+        self.pass_min_distance = float(self.get_parameter('pass_min_distance_m').value)
+        self.pass_clear_margin = float(self.get_parameter('pass_clear_margin_m').value)
+        self.pass_clear_stable = float(self.get_parameter('pass_clear_stable_ms').value) / 1000.0
+
         self.backup_duration = float(self.get_parameter('backup_duration_sec').value)
         self.v_backup = float(self.get_parameter('v_backup').value)
 
@@ -190,8 +208,9 @@ class UltrasonicDetourSupervisor(Node):
         self.odom_topic = str(self.get_parameter('odom_topic').value)
 
         # Derived
-        self.D_stop = self.robot_radius + self.safety_margin  # ~0.30
-        self.D_avoid = self.D_stop + self.avoid_extra         # ~0.55
+        self.D_stop = self.robot_radius + self.safety_margin
+        self.D_avoid = self.D_stop + self.avoid_extra
+        self.D_corner = self.D_stop + self.corner_extra
 
         # -------------------------
         # QoS
@@ -238,6 +257,9 @@ class UltrasonicDetourSupervisor(Node):
         self.pass_start_x = 0.0
         self.pass_start_y = 0.0
 
+        # NEW: early-exit timer during forward pass
+        self.pass_clear_seen_since = None
+
         # yaw cap for arc
         self.arc_yaw0 = 0.0
 
@@ -267,9 +289,11 @@ class UltrasonicDetourSupervisor(Node):
         self.create_subscription(Odometry, self.odom_topic, self.odom_callback, 20)
 
         for key in self.ranges.keys():
-            self.create_subscription(Range, f'/us/{key}',
-                                     lambda msg, k=key: self.range_callback(msg, k),
-                                     self.sensor_qos)
+            self.create_subscription(
+                Range, f'/us/{key}',
+                lambda msg, k=key: self.range_callback(msg, k),
+                self.sensor_qos
+            )
 
         self.cmd_pub = self.create_publisher(Twist, self.cmd_out_topic, 10)
 
@@ -277,9 +301,10 @@ class UltrasonicDetourSupervisor(Node):
         self.timer = self.create_timer(dt, self.control_loop)
 
         self.get_logger().info(
-            f"Supervisor v3: D_stop={self.D_stop:.2f}, D_avoid={self.D_avoid:.2f}, "
-            f"clear_front={self.clear_front:.2f}, detour_clear={self.detour_clear:.2f}, "
-            f"obstacle_min={self.obstacle_min:.2f}, max_arc_yaw={math.degrees(self.max_arc_yaw):.0f}deg"
+            f"Supervisor v3.1: D_stop={self.D_stop:.2f}, D_avoid={self.D_avoid:.2f}, D_corner={self.D_corner:.2f}, "
+            f"clear_front={self.clear_front:.2f}, detour_clear={self.detour_clear:.2f}, obstacle_min={self.obstacle_min:.2f}, "
+            f"max_arc_yaw={math.degrees(self.max_arc_yaw):.0f}deg, commit={self.commit_distance:.2f}, "
+            f"pass_min={self.pass_min_distance:.2f}, pass_clear_thr={(self.wall_target + self.pass_clear_margin):.2f}"
         )
 
     # ---------- Basic helpers ----------
@@ -449,8 +474,6 @@ class UltrasonicDetourSupervisor(Node):
     def should_exit_arc(self, dF, dL, dR):
         dObs = dL if self.obstacle_side == Side.LEFT else dR
         dDet = dR if self.detour_side == Side.RIGHT else dL
-
-        # IMPORTANT: detour-side must be open. obstacle-side only needs to be safe-min.
         return (dF > self.clear_front) and (dDet > self.detour_clear) and (dObs > self.obstacle_min)
 
     def start_forward_pass(self):
@@ -461,11 +484,11 @@ class UltrasonicDetourSupervisor(Node):
 
         self.pass_start_x = self.odom_x
         self.pass_start_y = self.odom_y
+        self.pass_clear_seen_since = None  # NEW
         self.mode = Mode.AVOID_FORWARD_PASS
         self.get_logger().info("Clear stable -> FORWARD_PASS")
 
     def forward_pass_cmd(self, dL, dR):
-        # steer away from obstacle-side only when too close
         dObs = dL if self.obstacle_side == Side.LEFT else dR
         sign = self.detour_side.value
 
@@ -496,32 +519,40 @@ class UltrasonicDetourSupervisor(Node):
             return
 
         if self.mode == Mode.NAVIGATING:
-            # Trigger avoidance mainly from FRONT
+            # Compute current nav cmd (needed for corner-trigger condition)
+            if (now - self.last_nav_cmd_time) > 0.5:
+                v_cmd_raw, w_cmd_raw = 0.0, 0.0
+            else:
+                v_cmd_raw, w_cmd_raw = self.nav_cmd.linear.x, self.nav_cmd.angular.z
+
+            # NEW: trigger condition includes corner obstacles
+            front_blocked = (dF < self.D_avoid)
+            corner_blocked = (v_cmd_raw > self.corner_v_min) and (min(dL, dR) < self.D_corner)
+            blocked = front_blocked or corner_blocked
+
             if now >= self.cooldown_until:
-                if dF < self.D_avoid:
+                if blocked:
                     if self.obstacle_seen_since is None:
                         self.obstacle_seen_since = now
                     elif (now - self.obstacle_seen_since) >= self.persistence:
                         self.get_logger().warn(
-                            f"Trigger: dF={dF:.2f} < D_avoid={self.D_avoid:.2f} -> AVOID"
+                            f"Trigger: blocked(front={front_blocked}, corner={corner_blocked}) "
+                            f"dF={dF:.2f}, dL={dL:.2f}, dR={dR:.2f} -> AVOID"
                         )
                         self.mode = Mode.AVOID_START
                         return
                 else:
                     self.obstacle_seen_since = None
             else:
-                if dF < self.D_stop:
+                # During cooldown: emergency trigger if very close
+                emergency = (dF < self.D_stop) or ((v_cmd_raw > self.corner_v_min) and (min(dL, dR) < self.D_stop))
+                if emergency:
                     self.get_logger().warn("Emergency trigger during cooldown -> AVOID")
                     self.mode = Mode.AVOID_START
                     return
 
             # forward nav2 cmd with small side safety
-            if (now - self.last_nav_cmd_time) > 0.5:
-                v_cmd, w_cmd = 0.0, 0.0
-            else:
-                v_cmd, w_cmd = self.nav_cmd.linear.x, self.nav_cmd.angular.z
-
-            v_cmd, w_cmd = self.nav_side_nudge(v_cmd, w_cmd, dL, dR)
+            v_cmd, w_cmd = self.nav_side_nudge(v_cmd_raw, w_cmd_raw, dL, dR)
             self.publish_cmd(v_cmd, w_cmd, dt)
             return
 
@@ -534,7 +565,6 @@ class UltrasonicDetourSupervisor(Node):
             self.clear_seen_since = None
             self.obstacle_seen_since = None
 
-            # record yaw start for cap
             if self.odom_ready:
                 self.arc_yaw0 = self.odom_yaw
             else:
@@ -547,28 +577,22 @@ class UltrasonicDetourSupervisor(Node):
             return
 
         if self.mode == Mode.AVOID_ARC:
-            # hard timeout
             if (now - self.avoid_started_at) > self.detour_max_time:
                 self.get_logger().warn("Detour timeout -> BACKUP")
                 self.backup_end_at = now + self.backup_duration
                 self.mode = Mode.AVOID_BACKUP
                 return
 
-            # yaw cap to prevent “turning to rear”
             if self.odom_ready:
                 dyaw = ang_wrap(self.odom_yaw - self.arc_yaw0)
                 if abs(dyaw) > self.max_arc_yaw:
-                    # If front is not terrible, stop arcing and do forward pass
                     if dF > (self.D_stop + 0.08):
                         self.get_logger().warn(
                             f"Arc yaw cap hit ({math.degrees(abs(dyaw)):.0f}deg) -> FORWARD_PASS"
                         )
                         self.start_forward_pass()
                         return
-                    # otherwise backup/flip
-                    self.get_logger().warn(
-                        f"Arc yaw cap hit but front still tight -> BACKUP"
-                    )
+                    self.get_logger().warn("Arc yaw cap hit but front still tight -> BACKUP")
                     self.backup_end_at = now + self.backup_duration
                     self.mode = Mode.AVOID_BACKUP
                     return
@@ -576,7 +600,6 @@ class UltrasonicDetourSupervisor(Node):
             v, w = self.compute_arc_cmd(dF, dL, dR)
             self.publish_cmd(v, w, dt)
 
-            # exit condition based on DETOUR side, stable for stable_ms
             if self.should_exit_arc(dF, dL, dR):
                 if self.clear_seen_since is None:
                     self.clear_seen_since = now
@@ -590,7 +613,6 @@ class UltrasonicDetourSupervisor(Node):
 
         if self.mode == Mode.AVOID_BACKUP:
             if now >= self.backup_end_at:
-                # flip detour direction
                 self.detour_side = Side.LEFT if self.detour_side == Side.RIGHT else Side.RIGHT
                 self.avoid_started_at = now
                 self.clear_seen_since = None
@@ -604,10 +626,9 @@ class UltrasonicDetourSupervisor(Node):
             return
 
         if self.mode == Mode.AVOID_FORWARD_PASS:
-            # distance traveled
             dx = self.odom_x - self.pass_start_x
             dy = self.odom_y - self.pass_start_y
-            dist = math.sqrt(dx*dx + dy*dy)
+            dist = math.sqrt(dx * dx + dy * dy)
 
             dObs = dL if self.obstacle_side == Side.LEFT else dR
 
@@ -615,19 +636,33 @@ class UltrasonicDetourSupervisor(Node):
             if dF < self.D_avoid or dObs < self.obstacle_min:
                 self.get_logger().warn("Too close during forward pass -> ARC")
                 self.clear_seen_since = None
-                # reset yaw cap reference for a new arc attempt
+                self.pass_clear_seen_since = None
                 if self.odom_ready:
                     self.arc_yaw0 = self.odom_yaw
                 self.mode = Mode.AVOID_ARC
                 return
 
+            # NEW: early exit if we've moved a little, and obstacle-side becomes clearly safe (stable)
+            clear_thr = self.wall_target + self.pass_clear_margin
+            early_clear = (dF > self.clear_front) and (dObs > clear_thr)
+
+            if dist >= self.pass_min_distance and early_clear:
+                if self.pass_clear_seen_since is None:
+                    self.pass_clear_seen_since = now
+                elif (now - self.pass_clear_seen_since) >= self.pass_clear_stable:
+                    self.stop_robot()
+                    self.mode = Mode.RESUME_GOAL
+                    return
+            else:
+                self.pass_clear_seen_since = None
+
+            # Original exit: fixed commit distance
             if dist >= self.commit_distance:
                 self.stop_robot()
                 self.mode = Mode.RESUME_GOAL
                 return
 
             v, w = self.forward_pass_cmd(dL, dR)
-            # also apply mild generic side safety
             v, w = self.nav_side_nudge(v, w, dL, dR)
             self.publish_cmd(v, w, dt)
             return
